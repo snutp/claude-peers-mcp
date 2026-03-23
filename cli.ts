@@ -11,8 +11,10 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
+import { hostname } from "os";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = process.env.CLAUDE_PEERS_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
@@ -60,7 +62,7 @@ switch (cmd) {
 
         console.log("\nPeers:");
         for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
+          console.log(`  ${p.id}  [${(p as any).machine_id || "local"}]  PID:${p.pid}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);
@@ -113,11 +115,26 @@ switch (cmd) {
       process.exit(1);
     }
     try {
+      // Register a temporary CLI peer so sender verification passes
+      const reg = await brokerFetch<{ id: string }>("/register", {
+        pid: process.pid,
+        machine_id: hostname(),
+        cwd: process.cwd(),
+        git_root: null,
+        git_remote_url: null,
+        tty: null,
+        summary: "CLI",
+      });
+
       const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-        from_id: "cli",
+        from_id: reg.id,
         to_id: toId,
         text: msg,
       });
+
+      // Clean up
+      await brokerFetch("/unregister", { id: reg.id });
+
       if (result.ok) {
         console.log(`Message sent to ${toId}`);
       } else {

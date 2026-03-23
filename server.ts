@@ -32,13 +32,17 @@ import {
   getRecentFiles,
 } from "./shared/summarize.ts";
 
+import { hostname } from "os";
+
 // --- Configuration ---
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = process.env.CLAUDE_PEERS_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
+const IS_REMOTE_BROKER = !!process.env.CLAUDE_PEERS_BROKER;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const MY_HOSTNAME = hostname();
 
 // --- Broker communication ---
 
@@ -70,17 +74,21 @@ async function ensureBroker(): Promise<void> {
     return;
   }
 
+  // Remote broker: don't auto-launch, just fail
+  if (IS_REMOTE_BROKER) {
+    throw new Error(
+      `Remote broker at ${BROKER_URL} is not reachable. ` +
+      `Start the broker on that machine first: CLAUDE_PEERS_NETWORK=tailscale bun broker.ts`
+    );
+  }
+
   log("Starting broker daemon...");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
   });
 
-  // Unref so this process can exit without waiting for the broker
   proc.unref();
 
-  // Wait for it to come up
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));
     if (await isBrokerAlive()) {
@@ -133,11 +141,30 @@ function getTty(): string | null {
   return null;
 }
 
+async function getGitRemoteUrl(cwd: string): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["git", "remote", "get-url", "origin"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const text = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code === 0) {
+      return text.trim();
+    }
+  } catch {
+    // no remote
+  }
+  return null;
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myGitRemoteUrl: string | null = null;
 
 // --- MCP Server ---
 
@@ -148,7 +175,7 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances can see you and send you messages — including instances on other machines connected via the same network.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
@@ -170,7 +197,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List other Claude Code instances connected to this broker. Returns their ID, host, working directory, git repo, and summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -178,7 +205,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["machine", "directory", "repo"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            'Scope of peer discovery. "machine" = all instances connected to the broker (including remote machines). "directory" = same working directory. "repo" = same git repository (matches by path or remote URL across machines).',
         },
       },
       required: ["scope"],
@@ -246,6 +273,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
+          git_remote_url: myGitRemoteUrl,
           exclude_id: myId,
         });
 
@@ -263,6 +291,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Host: ${p.machine_id || "(local)"}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -457,10 +486,14 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  myGitRemoteUrl = await getGitRemoteUrl(myCwd);
   const tty = getTty();
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`Git remote: ${myGitRemoteUrl ?? "(none)"}`);
+  log(`Host: ${MY_HOSTNAME}`);
+  log(`Broker: ${BROKER_URL}${IS_REMOTE_BROKER ? " (remote)" : ""}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
@@ -488,14 +521,20 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
+  async function registerWithBroker(summary: string): Promise<string> {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      machine_id: MY_HOSTNAME,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      git_remote_url: myGitRemoteUrl,
+      tty,
+      summary,
+    });
+    return reg.id;
+  }
+
+  myId = await registerWithBroker(initialSummary);
   log(`Registered as peer ${myId}`);
 
   // If summary generation is still running, update it when done
@@ -519,13 +558,18 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat (with auto-re-register if broker lost our registration)
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        const result = await brokerFetch<{ ok: boolean; registered: boolean }>("/heartbeat", { id: myId });
+        if (!result.registered) {
+          log("Broker lost our registration, re-registering...");
+          myId = await registerWithBroker(initialSummary);
+          log(`Re-registered as peer ${myId}`);
+        }
       } catch {
-        // Non-critical
+        // Broker temporarily down, will retry next interval
       }
     }
   }, HEARTBEAT_INTERVAL_MS);

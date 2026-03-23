@@ -4,8 +4,10 @@ export type PeerId = string;
 export interface Peer {
   id: PeerId;
   pid: number;
+  machine_id: string; // hostname of the machine
   cwd: string;
   git_root: string | null;
+  git_remote_url: string | null; // for cross-machine repo scope matching
   tty: string | null;
   summary: string;
   registered_at: string; // ISO timestamp
@@ -25,8 +27,10 @@ export interface Message {
 
 export interface RegisterRequest {
   pid: number;
+  machine_id: string;
   cwd: string;
   git_root: string | null;
+  git_remote_url: string | null;
   tty: string | null;
   summary: string;
 }
@@ -49,6 +53,7 @@ export interface ListPeersRequest {
   // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
+  git_remote_url?: string | null; // for cross-machine repo scope
   exclude_id?: PeerId;
 }
 
